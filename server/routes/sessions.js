@@ -1,0 +1,15 @@
+import { newId, nowIso, } from '../db.js';
+import { send, badRequest, notFound, conflict, deviceBusy } from '../http.js';
+import { assertCan, assertCanStartSession } from '../permissions.js';
+import { audit, auditDenials } from '../audit.js';
+import { snapshotAuthority, sessionExpiry } from '../lifecycle.js';
+
+const MODES=['view','control','terminal'];
+function expire(db,org){const now=nowIso();db.prepare("UPDATE sessions SET state='ended',ended_at=?,end_reason='session_expired' WHERE org_id=? AND state='active' AND expires_at<=?").run(now,org,now);}
+function getDevice(db,org,id){const d=db.prepare('SELECT * FROM devices WHERE id=? AND org_id=? AND deleted_at IS NULL').get(id,org);if(!d)throw notFound();return d;}
+export function register(router,{db}){
+  router.post('/v1/orgs/:org/sessions',(ctx,p,res)=>{const deviceId=String(ctx.body.deviceId??'');const mode=String(ctx.body.mode??'');if(!MODES.includes(mode))throw badRequest(`mode must be one of: ${MODES.join(', ')}`);getDevice(db,p.org,deviceId);auditDenials(db,ctx,{action:'session.start',targetType:'device',targetId:deviceId},()=>assertCanStartSession(db,ctx,mode,deviceId));expire(db,p.org);const id=newId('ses');try{db.prepare(`INSERT INTO sessions(id,org_id,user_id,device_id,mode,state,authorized_by,expires_at) VALUES(?,?,?,?,?,'active',?,?)`).run(id,p.org,ctx.userId,deviceId,mode,snapshotAuthority(db,{userId:ctx.userId,orgId:p.org,deviceId}),sessionExpiry(db,p.org));}catch(e){if(String(e.code).startsWith('SQLITE_CONSTRAINT'))throw deviceBusy();throw e;}audit(db,{orgId:p.org,actorId:ctx.userId,action:'session.start',targetType:'device',targetId:deviceId,result:'allow',requestId:ctx.requestId});send(res,201,{id,deviceId,mode,state:'active'});});
+  router.get('/v1/orgs/:org/sessions',(ctx,p,res)=>{assertCan(db,ctx,'session:view');expire(db,p.org);send(res,200,{sessions:db.prepare(`SELECT s.id,s.user_id,u.name user_name,s.device_id,d.name device_name,s.mode,s.state,s.end_reason,s.started_at,s.ended_at,s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id JOIN devices d ON d.id=s.device_id WHERE s.org_id=? ORDER BY s.started_at DESC LIMIT 200`).all(p.org)});});
+  router.get('/v1/sessions/:id',(ctx,p,res)=>{expire(db,ctx.orgId);const s=db.prepare('SELECT * FROM sessions WHERE id=? AND org_id=?').get(p.id,ctx.orgId);if(!s)throw notFound();if(s.user_id!==ctx.userId)assertCan(db,ctx,'session:view');send(res,200,s);});
+  router.delete('/v1/sessions/:id',(ctx,p,res)=>{expire(db,ctx.orgId);const s=db.prepare('SELECT * FROM sessions WHERE id=? AND org_id=?').get(p.id,ctx.orgId);if(!s)throw notFound();const own=s.user_id===ctx.userId;if(!own)auditDenials(db,ctx,{action:'session.terminate',targetType:'session',targetId:p.id},()=>assertCan(db,ctx,'session:terminate'));if(s.state==='ended')throw conflict('session already ended');db.prepare('UPDATE sessions SET state=\'ended\',ended_at=?,end_reason=? WHERE id=?').run(nowIso(),own?'user_stopped':'admin_terminated',p.id);audit(db,{orgId:ctx.orgId,actorId:ctx.userId,action:own?'session.stop':'session.terminate',targetType:'session',targetId:p.id,result:'allow',requestId:ctx.requestId});send(res,204);});
+}

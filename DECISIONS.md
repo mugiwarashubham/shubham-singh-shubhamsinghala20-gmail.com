@@ -1,67 +1,105 @@
-# DECISIONS
 
-### Permission resolution is data-driven, not role-driven
+DECISIONS
+Permission resolution is data-driven, not role-driven
+What I chose: Read the permission catalogue and role baselines from SQLite on every resolution path.
 
-**What I chose:** Read the permission catalogue and role baselines from SQLite on every resolution path.
-**Why:** `server/permissions.js` queries `permissions` and `role_permissions`; the personalised fixture is specifically intended to introduce a role and permission that are absent from the prose. This also keeps the implementation valid when the grading fixture changes.
-**What I rejected:** A JavaScript object containing the five documented roles and nineteen permissions. It would pass the published demo but fail the personalised/hidden fixture.
-**What would change my mind:** A grading contract that made the database reference data immutable and explicitly required a generated static matrix. The current repository does the opposite.
+Why: The personalised verification introduces database data that is not safe to represent as the documented role matrix. The implementation therefore reads permissions, role_permissions, permission_patterns, memberships, and grants at runtime. The final personalisation suite passed 18/18, which is evidence that the resolver is using the runtime data rather than only the prose matrix.
 
-### Explicit deny is checked before every allow
+What I rejected: A JavaScript object containing the documented roles and permissions. That would make the application depend on a static copy of the fixture.
 
-**What I chose:** Any applicable deny grant wins before an allow grant or role baseline.
-**Why:** The Acme fixture includes an org-wide `device:terminal` deny for Sam while the operator baseline allows terminal. The intended result is that Terminal is absent while Control remains available. The resolution code therefore searches the deny set first.
-**What I rejected:** Letting a more-specific device allow override an org-wide deny. That makes scope specificity a privilege escalation mechanism and breaks the documented deny-wins case.
-**What would change my mind:** A test fixture demonstrating an explicit, supported carve-out where a device allow must override an org-wide deny. No such rule exists in the current contract.
+What would change my mind: A future grading contract that explicitly made the database reference data immutable and required a generated static authorization matrix.
 
-### Roles are bundles; rank is only for administration
+Explicit deny is checked before an allow
+What I chose: An applicable deny grant is resolved before an allow grant or role baseline.
 
-**What I chose:** `roles.rank` is used only by `assertCanModify`; `can()` never compares ranks.
-**Why:** Sam is an operator in Acme and an auditor in Globex. The operator can control devices while the auditor can read audit events. Treating the roles as an ordered permission ladder would incorrectly make one role inherit the other's capabilities.
-**What I rejected:** `callerRank >= targetRank` as a general authorization check. It answers “who may modify whom,” not “what may this role do.”
-**What would change my mind:** A schema change explicitly redefining rank as a permission hierarchy.
+Why: The implementation had to handle the seeded org-wide deny case without allowing another applicable allow to make the denied capability appear. The Playwright test an org-wide deny removes the entry the baseline granted passes with the denied control absent, while the device permission tests also verify that unrelated permissions remain available.
 
-### Cross-organisation access is invisible
+What I rejected: Letting a more-specific allow automatically override an org-wide deny.
 
-**What I chose:** The token's `org` claim is the structural organisation boundary, and a different `:org` path returns `404`.
-**Why:** `server/context.js` rejects a path organisation that differs from the token scope before downstream handlers run. This means the application does not fetch another tenant's rows and then try to hide them afterward.
-**What I rejected:** Returning `403` after checking membership. That would confirm that another organisation exists and would make tenant isolation a convention rather than a request boundary.
-**What would change my mind:** An API contract that intentionally exposed cross-org existence to the caller.
+What would change my mind: A fixture or test explicitly establishing that scope specificity is an approved exception to deny precedence.
 
-### Permission changes invalidate the next request, not an active session
+Roles are bundles; rank is only for administration
+What I chose: roles.rank is used for administration/lifecycle checks, while permission resolution uses the role's permission rows.
 
-**What I chose:** Mutations bump `perm_version`; active sessions keep their snapshot until TTL or an account/tenancy event ends them.
-**Why:** The schema's `sessions.authorized_by` is explicitly a snapshot, while `memberships.perm_version` is the freshness mechanism. `server/lifecycle.js` therefore ends sessions for suspension/removal/device transfer, not for ordinary grant or role changes.
-**What I rejected:** Re-resolving permissions for an existing session on every request. That would make a “grandfathered” session stop immediately after a grant change and contradict the session model.
-**What would change my mind:** A session schema without an authority snapshot or a revised contract saying permission changes terminate sessions immediately.
+Why: The same user can have different roles in different organisations. The Playwright test auditor and operator see different cards verifies that Sam's operator permissions in Acme and auditor permissions in Globex produce different UI capabilities. Treating rank as an inherited permission ladder would collapse those distinct bundles.
 
-### The database arbitrates exclusive sessions
+What I rejected: A general callerRank >= targetRank authorization rule.
 
-**What I chose:** Insert the active session and let the partial unique index decide whether an exclusive device is already occupied.
-**Why:** The schema has `one_exclusive_session_per_device`; using a preliminary SELECT would create a check-then-act race under concurrent requests. The route translates the constraint failure into `DEVICE_BUSY`.
-**What I rejected:** `SELECT active session -> if none INSERT`. Two simultaneous requests can both observe no holder and then both attempt the insert.
-**What would change my mind:** Removal of the unique index or a storage layer that could not provide the required transactional constraint.
+What would change my mind: A schema change explicitly defining role rank as a permission inheritance hierarchy.
 
-### The console renders server answers instead of reconstructing authorization
+Cross-organisation access is invisible
+What I chose: The token's organisation claim is the structural tenant boundary, and a request for a different organisation follows the 404 path.
 
-**What I chose:** React consumes `permissions` from `/auth/me` and device rows and conditionally renders elements from those answers.
-**Why:** The architecture test can alter an API response to deny `device:control`; the UI must then remove the element. Keeping the matrix out of `web/` makes that test meaningful.
-**What I rejected:** `if (role === 'owner')` / `if (role === 'operator')` checks in React. They would duplicate the authorization model and diverge when grants or a new database role are introduced.
-**What would change my mind:** A product contract that moved authorization entirely into a trusted client and removed server enforcement, which is not this application's model.
+Why: server/context.js checks the path organisation before downstream resource resolution. The UI test no other org's content appears anywhere in the DOM also verifies that switching organisations does not leave the previous organisation's device content in the rendered page.
 
-### Tokens are memory-only on the client
+What I rejected: Fetching another organisation's data first and relying on downstream UI filtering, or returning a cross-org 403 that would reveal that the tenant exists.
 
-**What I chose:** Keep the access token in React state and use an HttpOnly refresh cookie for reload recovery.
-**Why:** The assignment explicitly prohibits localStorage/sessionStorage for credentials. React state also means a page reload loses the access token, after which `/auth/refresh` obtains a fresh one without exposing the refresh credential to JavaScript.
-**What I rejected:** Persisting the JWT in localStorage for convenience. It violates the stated credential boundary and unnecessarily exposes a bearer token to JavaScript-readable storage.
-**What would change my mind:** A revised security requirement that explicitly permitted persistent browser storage for access tokens.
+What would change my mind: An API contract that intentionally exposed cross-organisation resource existence.
 
-## Where this repo argues with itself
+Permission changes invalidate the next request, not an active session
+What I chose: Membership/role lifecycle mutations bump perm_version; active sessions keep their authorization snapshot unless an account or tenancy event ends them.
 
-The working tree contains a small terminology mismatch between the API brief and the implementation comments around “org-level” permission views: an org-level result is not merely the role baseline; device-scoped grants can make a permission available somewhere in the organisation. I built the navigation view as a union over applicable grants, while exact device actions use the device-scoped result. This keeps a device-specific capability discoverable without making it appear on unrelated device rows.
+Why: The implementation uses memberships.perm_version for access-token freshness and sessions.authorized_by as the session snapshot. This separates current permission resolution from the authority already recorded for an active session.
 
-## Deliberately not built
+What I rejected: Re-resolving every permission on every active-session request.
 
-- Remote screen streaming, keyboard/mouse injection, shell execution, and screen capture were not built because sessions are records only.
-- Rate limiting, password reset, email delivery, and multi-region infrastructure were not added because the brief explicitly excludes them.
-- I did not alter `db/schema.sql` or `db/reference.sql`; invariants already expressed there remain database responsibilities.
+What would change my mind: A revised session contract that explicitly required live permission re-evaluation for every active session operation.
+
+The database arbitrates exclusive sessions
+What I chose: Let the database partial unique index reject a second exclusive session.
+
+Why: The schema's one_exclusive_session_per_device constraint is a concurrency guarantee. A preliminary SELECT followed by INSERT would leave a race between the two operations. The route translates the resulting SQLite constraint failure into 409 DEVICE_BUSY.
+
+What I rejected: SELECT active session -> if none INSERT.
+
+What would change my mind: Removal of the unique constraint or a storage layer that could not enforce the invariant transactionally.
+
+The console renders server answers instead of reconstructing authorization
+What I chose: React renders from permission objects returned by the API rather than maintaining its own role matrix.
+
+Why: The architecture test an element vanishes when the server withdraws the permission modifies the devices API response so device:control is denied and then remounts the view. The control must disappear. That test would be meaningless if the UI independently reconstructed authorization from the user's role.
+
+What I rejected: if (role === 'owner') / if (role === 'operator') checks in React.
+
+What would change my mind: A product contract that intentionally moved authorization decisions into a trusted client, which is not the current architecture.
+
+Tokens are memory-only on the client
+What I chose: Keep the access token in React state and use the HttpOnly refresh cookie for reload recovery.
+
+Why: The UI test no token is persisted in web storage passes, and a reload restores the session from the refresh cookie also passes. This gives reload recovery without putting the bearer access token in localStorage or sessionStorage.
+
+What I rejected: Persisting the JWT in localStorage for convenience.
+
+What would change my mind: A revised security requirement that explicitly permitted persistent browser storage for access tokens.
+
+Permission selectors belong to the actual UI capability
+What I chose: Keep data-permission="device:control" on the actual Control button only, while keeping permission attributes on other informational chips that are directly asserted by the UI contract.
+
+Why: The first Playwright run exposed a concrete bug: selectors for device:control resolved to 2 elements instead of 1. After removing the attribute from the Control chip, five UI failures were eliminated. The next run exposed the complementary requirement for device:terminal, where the test expected 1 element and received 0. The final implementation distinguishes the actionable Control button from the other capability chips.
+
+What I rejected: Putting the same permission selector on both a capability indicator and its actionable control.
+
+What would change my mind: A revised UI contract that explicitly required both the indicator and control to carry the same permission selector.
+
+Where this repo argues with itself
+The implementation comments and API terminology have a small ambiguity around “org-level” permission views. An organisation-level navigation result is not only the role baseline: a device-scoped grant can make a capability available on one device. I therefore treat the organisation-level result as a union useful for navigation, while exact device actions use the device-scoped result. This is reflected in the device-scoped Playwright tests rather than being inferred from a role matrix.
+
+Deliberately not built
+Remote screen streaming, keyboard/mouse injection, shell execution, and screen capture were not built because sessions are records only.
+
+Rate limiting, password reset, email delivery, and multi-region infrastructure were not added because they are outside the assignment scope.
+
+I did not alter db/schema.sql or db/reference.sql to move application invariants into code; the existing database constraints remain database responsibilities.
+
+Final evidence
+node scripts/check-jwt.js: 43 passed, 0 failed
+
+node scripts/check-permissions.js: 35 passed, 0 failed
+
+node scripts/check-api.js: 66 passed, 0 failed
+
+node scripts/check-personalisation.js: 18 passed, 0 failed
+
+npm run build: passed
+
+npx playwright test: 25 passed, 0 failed

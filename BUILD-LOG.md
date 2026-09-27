@@ -1,60 +1,111 @@
-# BUILD-LOG
+BUILD-LOG
 
-## Phase 0 — orientation
+Phase 0 — orientation
 
-- The starter initially had every `/v1` route unregistered and the permission/auth modules were explicit stubs.
-- I first treated the database tables as the model instead of copying the role matrix into application code; the personalised check is designed specifically to catch that mistake.
-- One practical constraint showed up immediately: `better-sqlite3` is a native dependency, so local verification depends on a successful `npm ci` before the API suites can run.
+Prediction: I initially expected the existing starter to be enough to begin running the verification suites. The first practical blocker was the native better-sqlite3 dependency: npm ci could not use a Node 24 prebuilt binary and fell back to node-gyp, which failed because the required Visual Studio C++ build tools were not installed.
 
-## Phase 1 — token verification
+What I learned: I verified the database driver separately with better-sqlite3@12.10.0; the check returned SQLite OK, which gave me a working local database path without changing the application architecture.
 
-- I implemented the verifier in `server/auth.js` and ran `node scripts/check-jwt.js`: **43 passed, 0 failed**.
-- A small implementation detail mattered: `timingSafeEqual` throws when buffers have different lengths, so the signature check compares lengths before calling it.
-- The verifier reads and validates the header before using the HS256 key, then verifies the signature, then validates the claims. This keeps `alg: none` and algorithm substitution out of the accepted path.
+Open point from the repository: the personalised check was designed to introduce database roles/permissions not present in the prose. I therefore treated SQLite as the source of truth for roles, permissions, and grants instead of creating a JavaScript role matrix.
 
-## Phase 2 — caller context and the resolution engine
+Phase 1 — token verification
 
-- I kept organisation scope in the token and checked the URL organisation against that claim before any permission decision; a mismatch becomes the same 404 path as an invisible resource.
-- The first implementation of `assertCanStartSession` resolved the same device twice. I removed that duplicate lookup so the compound check uses one resolved set and still returns two distinct failure reasons.
-- The resolution engine reads `permissions`, `role_permissions`, `permission_patterns`, `memberships`, and live grants at runtime. The personalised check therefore does not depend on the documented five-role matrix.
-- I implemented the precedence as: inactive/suspended identity gate, explicit deny, allow grant, role baseline, implicit deny. Device-scoped grants are considered in the exact device question; the org-level view is a union used for navigation.
+I implemented the verifier in server/auth.js and ran node scripts/check-jwt.js: 43 passed, 0 failed.
 
-## Phase 3 — orgs, members, invites
+Wrong implementation detail caught while reasoning about the verifier: timingSafeEqual cannot safely be called on buffers of different lengths. I added a length check before comparing the signature bytes.
 
-- Role changes and membership status changes bump `perm_version`; the next request therefore detects a stale token instead of waiting for JWT expiry.
-- I kept the last-owner rule in one lifecycle helper because role change, suspension, removal, and self-leave all have the same invariant.
-- Invite tokens are generated once and stored only as hashes. The raw token is returned from the creation endpoint and is never written to the audit log.
+I validate the JWT header before accepting the algorithm, verify the HS256 signature, and then validate the claims. This keeps alg: none and algorithm-substitution paths out of the accepted path.
 
-## Phase 4 — devices and grants
+The useful measurement here was the complete JWT suite result: 43/43, rather than relying on a single happy-path token.
 
-- The device list uses the server-resolved permission set for each row. A device without `device:view` is filtered out rather than rendered with redacted data.
-- I changed the list path to use `resolveDevices` so the grant query is batched rather than performing a separate grant query for every device row.
-- Grant validation uses the database foreign key for the final permission-pattern check and maps an unknown pattern to `400 unknown_permission`; the connection already enables `foreign_keys` in `server/db.js`.
+Phase 2 — caller context and permission resolution
 
-## Phase 5 — sessions
+Decision I had to settle: whether role names/ranks should directly determine permissions. I rejected that model because the personalised database contains an additional role and permission. The resolver instead reads permissions, role_permissions, permission_patterns, memberships, and grants at runtime.
 
-- Session creation checks `session:start` and the mode-specific device permission separately. This preserves the required distinction between `missing_permission` and `missing_device_permission`.
-- The database's partial unique index is the concurrency guard for exclusive sessions. The route translates the resulting SQLite constraint failure into `409 DEVICE_BUSY` rather than doing a check-then-insert race.
-- Session authority is snapshotted in `authorized_by`. Permission changes do not terminate active sessions; suspension, membership removal, and device tenancy changes do.
+I made the organisation in the access token the request boundary. server/context.js checks the URL organisation against the token scope before downstream permission resolution.
 
-## Phase 6 — audit
+Bug found in my own implementation: assertCanStartSession was resolving the same device twice. I removed the duplicate lookup so the compound check uses one resolved device set while preserving separate missing_permission and missing_device_permission outcomes.
 
-- I record denied permission-gated operations through `auditDenials` and successful mutations at the point the mutation succeeds.
-- I did not add update/delete helpers for audit events. The schema triggers are the storage-level protection, so the application only appends.
+The final permission suite measured 35 passed, 0 failed.
 
-## Phase 7 — the console
+Phase 3 — orgs, members, and invites
 
-- The React console does not contain a role-to-permission matrix. It renders the permission objects returned by the API.
-- During the UI pass I caught an implementation bug before testing: I had put `data-permission` on both a capability chip and its Control button, which would have made the contract selector return two elements. I removed the attribute from the informational chip so the button is the single permission-gated control.
-- Access tokens are kept in React state. Refresh is performed through the `HttpOnly` cookie, with no localStorage or sessionStorage persistence.
+I kept role/member lifecycle rules in server/lifecycle.js so role changes, suspension, removal, and owner protection use the same invariant instead of separate route-specific checks.
 
-## Phase 8 — hardening
+Open point I had to settle: whether an accepted invite should remain reusable and what status the acceptance endpoint should return. The API verification established the expected behaviour, so the invite route was adjusted to return the expected successful status and conflict on reuse.
 
-- `node --check` passes for the newly written server modules.
-- The JWT suite is green at 43/43. Full SQLite/API/Playwright execution is pending the native `better-sqlite3` build completing in this environment.
-- I deliberately did not add remote-control functionality, shell execution, screen capture, or other features outside the assignment's stated record-only session model.
+Invite tokens are generated once and stored as hashes; the raw token is returned only from the creation response and is not written to the audit log.
 
-## Open threads
+The final Playwright test an invite link can be redeemed passed.
 
-- The final submission still needs to be placed into the candidate's own Git repository with genuine incremental commits and pushed publicly before the deadline.
-- Full API and Playwright suites must be run on a machine where `npm ci` completes successfully; the code should not be treated as fully verified until those suites are green.
+Phase 4 — devices and grants
+
+The device list uses server-resolved permissions. A device without device:view is omitted rather than rendered as a redacted row.
+
+I changed the device resolution path to use resolveDevices, allowing the grant information to be resolved as a batch rather than issuing a separate grant lookup for every device row.
+
+Database guarantee I relied on: grant permission validation ultimately uses the database permission-pattern data and foreign-key enforcement. The route maps an unknown permission pattern to 400 unknown_permission instead of maintaining a second hardcoded permission list.
+
+The final UI tests covered device-scoped grants, org-wide deny precedence, grant listing, and creating a grant through the UI.
+
+Phase 5 — sessions
+
+Session creation checks the general session:start permission separately from the mode-specific device permission. This preserves the distinction between missing_permission and missing_device_permission.
+
+Decision reversed: I did not implement exclusive-session protection as SELECT active session -> INSERT. The database already has the partial unique index one_exclusive_session_per_device; relying on that constraint avoids a check-then-insert race.
+
+The route translates the resulting SQLite constraint failure into 409 DEVICE_BUSY.
+
+sessions.authorized_by is treated as the authorization snapshot for an active session. Ordinary permission changes do not rewrite that snapshot; suspension, membership removal, and device-tenancy changes are handled as session-ending lifecycle events.
+
+Phase 6 — audit
+
+Denied permission-gated operations are recorded through auditDenials, while successful mutations are recorded after the mutation succeeds.
+
+I deliberately did not create application update/delete helpers for audit events. The schema triggers provide the storage-level protection, so the application treats audit events as append-only.
+
+The relevant design check is therefore not an application-side delete guard but whether the database invariant remains intact.
+
+Phase 7 — console and UI verification
+
+The React console does not contain a role-to-permission matrix. It consumes permission objects returned by /auth/me and the device API.
+
+Bug found by the Playwright suite: the device:control permission attribute was initially present on both the informational capability chip and the Control button. The test auditor and operator see different cards and the related device tests reported Expected: 1, Received: 2. I removed data-permission="device:control" from the informational chip and kept it on the actual Control button.
+
+That fix exposed a second UI-contract detail: device:terminal still needed its own data-permission attribute. The test a grant created through the UI surfaces the item it grants reported Expected: 1, Received: 0. I restored the attribute for non-control permission chips while leaving the Control selector unique.
+
+Measured result: after those fixes, the Playwright suite went from 19/25, to 24/25, to the final 25/25.
+
+The invite flow also had a UI-state bug: after successful acceptance it showed a static “Invite accepted” message, while the test expected the normal login-form. I changed the successful state to render the sign-in form; an invite link can be redeemed then passed.
+
+Access tokens remain in React state. Reload recovery uses the HttpOnly refresh cookie, and the test no token is persisted in web storage passed.
+
+Phase 8 — Windows/runtime hardening
+
+Environment-specific failure: the original scripts/load-db.js used new URL(...).pathname, which produced a path form that failed on Windows. I changed the path handling to use fileURLToPath.
+
+After that change, npm run db:reset completed and reported the seeded counts: 3 organizations, 8 users, 10 memberships, 9 devices, 6 grants, 3 sessions, 7 audit events, 20 permissions, and 27 patterns.
+
+npx playwright install chromium completed successfully.
+
+npm run build passed with Vite 6.4.3.
+
+Final verification
+
+All supplied automated verification completed successfully:
+
+JWT: 43/43 passed
+
+Permissions: 35/35 passed
+
+API: 66/66 passed
+
+Personalisation: 18/18 passed
+
+Production build: PASS
+
+Playwright UI: 25/25 passed
+
+Final Playwright runtime: 18.2 seconds
+
+The remaining work is repository hygiene, preserving genuine incremental Git history, pushing the candidate repository publicly, and completing the submission form.

@@ -3,7 +3,6 @@ import { send, badRequest, notFound, conflict, normalizeTs, forbidden } from '..
 import { assertCan, assertMayGrant, resolve, resolveDevices } from '../permissions.js';
 import { audit, auditDenials } from '../audit.js';
 import { endActiveSessions } from '../lifecycle.js';
-
 const KINDS=['macos','windows','linux','android','ios'];
 function device(db,org,id){const row=db.prepare('SELECT * FROM devices WHERE id=? AND org_id=? AND deleted_at IS NULL').get(id,org);if(!row)throw notFound();return row;}
 export function register(router,{db}){
@@ -23,7 +22,12 @@ export function register(router,{db}){
 
   router.get('/v1/orgs/:org/grants',(ctx,p,res)=>{assertCan(db,ctx,'user:read');const userId=ctx.query.get('userId');const rows=db.prepare(`SELECT g.id,g.user_id,g.device_id,g.effect,g.starts_at,g.expires_at,g.created_at,group_concat(gp.permission) permissions FROM grants g JOIN grant_permissions gp ON gp.grant_id=g.id WHERE g.org_id=? AND g.revoked_at IS NULL ${userId?'AND g.user_id=?':''} GROUP BY g.id ORDER BY g.created_at DESC`).all(...(userId?[p.org,userId]:[p.org]));send(res,200,{grants:rows.map(r=>({...r,permissions:r.permissions.split(',')}))});});
   router.post('/v1/orgs/:org/grants',(ctx,p,res)=>{
-    const {userId,deviceId=null,effect,permissions,startsAt=null,expiresAt=null}=ctx.body; auditDenials(db,ctx,{action:'grant.create',targetType:'user',targetId:userId},()=>assertCan(db,ctx,'grant:create')); if(userId===ctx.userId)throw Object.assign(new Error('you cannot create a grant for yourself'),{status:403,code:'FORBIDDEN',reason:'self_grant'});if(typeof userId!=='string')throw badRequest('userId is required');if(!Array.isArray(permissions)||!permissions.length)throw badRequest('permissions must be a non-empty array');if(effect!=='allow'&&effect!=='deny')throw badRequest("effect must be 'allow' or 'deny'");
+    const {userId,deviceId=null,effect,permissions,startsAt=null,expiresAt=null}=ctx.body;
+    auditDenials(db,ctx,{action:'grant.create',targetType:'user',targetId:userId},()=>assertCan(db,ctx,'grant:create'));
+    if(userId===ctx.userId){
+      throw forbidden('you cannot create a grant for yourself','self_grant');
+    }
+    if(typeof userId!=='string')throw badRequest('userId is required');if(!Array.isArray(permissions)||!permissions.length)throw badRequest('permissions must be a non-empty array');if(effect!=='allow'&&effect!=='deny')throw badRequest("effect must be 'allow' or 'deny'");
     const target=db.prepare("SELECT 1 FROM memberships WHERE org_id=? AND user_id=? AND status='active'").get(p.org,userId);if(!target)throw notFound();if(deviceId!==null&&!device(db,p.org,deviceId))throw notFound();const start=normalizeTs(startsAt,'startsAt'),end=normalizeTs(expiresAt,'expiresAt'),now=nowIso();if(end&&end<=now)throw badRequest('expiresAt is in the past','expired_grant');if(start&&end&&end<=start)throw badRequest('expiresAt must be after startsAt');
     // Ensure the DB catalogue validates the literal pattern; the permission engine validates authority.
     assertMayGrant(db,ctx,[...new Set(permissions)],deviceId);
